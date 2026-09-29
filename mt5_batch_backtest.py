@@ -1,0 +1,903 @@
+"""
+MT5 Batch Backtest Runner
+=========================
+Generates a MT5 tester .ini file for each .set file in a folder,
+updates EA_Comment in each .set file, then launches MT5 terminal
+for each backtest sequentially.
+
+On first run: detects MT5 installations and saves config.
+Subsequent runs: loads saved config, prompts to use same or modify.
+
+Usage: python mt5_batch_backtest.py
+"""
+
+import os
+import re
+import sys
+import glob
+import subprocess
+import time
+import shutil
+import json
+from datetime import date
+
+# ── MT5 Period constants ───────────────────────────────────────────────────────
+PERIOD_MAP = {
+    'M1'   : 'M1',
+    'M5'   : 'M5',
+    'M15'  : 'M15',
+    'M30'  : 'M30',
+    'H1'   : 'H1',
+    'H2'   : 'H2',
+    'H3'   : 'H3',
+    'H4'   : 'H4',
+    'H6'   : 'H6',
+    'H8'   : 'H8',
+    'H12'  : 'H12',
+    'D'    : 'Daily',
+    'D1'   : 'Daily',
+    'DAILY': 'Daily',
+    'W1'   : 'Weekly',
+    'MN'   : 'Monthly',
+}
+
+# ── ENUM_TIMEFRAMES value → tester Period name (for UBS set file mode) ────────
+TF_ENUM_TO_PERIOD = {
+    '1'    : 'M1',  '2'  : 'M2',  '3'  : 'M3',  '4'  : 'M4',
+    '5'    : 'M5',  '6'  : 'M6',  '10' : 'M10', '12' : 'M12',
+    '15'   : 'M15', '20' : 'M20', '30' : 'M30',
+    '16385': 'H1',  '16386': 'H2', '16387': 'H3', '16388': 'H4',
+    '16390': 'H6',  '16392': 'H8', '16396': 'H12',
+    '16408': 'Daily', '32769': 'Weekly', '49153': 'Monthly',
+}
+
+# ── Model labels ─────────────────────────────────────────────────────────────
+# MT5 tester ini "Model" codes (per MetaQuotes docs):
+#   0 = Every tick (generated from M1)   1 = 1 minute OHLC
+#   2 = Open prices only                 3 = Math calculations
+#   4 = Every tick based on REAL ticks   (there is no 5 — MT5 falls back to
+#                                          generated ticks; the old '5' →
+#                                          'EVERYTICKREAL' label was WRONG:
+#                                          those reports were generated-tick)
+MODEL_LABELS = {
+    '1' : 'OHLC',
+    '0' : 'EVERYTICK',
+    '4' : 'REALTICKS',
+    '2' : 'OPENPRICES',
+}
+# Old configs saved with the bogus '5' meant "real ticks" — map to 4.
+MODEL_MIGRATE = {'5': '4'}
+
+# ── Defaults (used if no config found) ────────────────────────────────────────
+DEFAULTS = {
+    'terminal_path' : r"C:\Program Files\MetaTrader 5\terminal64.exe",
+    'tester_folder' : '',
+    'ea_name'       : '',
+    'from_date'     : '2018.01.01',
+    'to_date'       : date.today().strftime('%Y.%m.%d'),
+    'model'         : '1',
+    'deposit'       : '10000',
+    'currency'      : 'USD',
+    'leverage'      : '100',
+    'optimization'  : '0',
+    'suffix'        : '',
+}
+
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mt5_batch_config.json')
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def prompt(text, default=None):
+    if default is not None and default != '':
+        val = input(f"  {text} [{default}]: ").strip()
+        return val if val else default
+    else:
+        while True:
+            val = input(f"  {text}: ").strip()
+            if val:
+                return val
+            print("    (required)")
+
+
+
+def _is_optimisation_file(filename: str) -> bool:
+    """Return True if the filename contains 'optimiz' or 'optimis' (any case)."""
+    n = filename.lower()
+    return 'optimiz' in n or 'optimis' in n
+
+def load_config():
+    if os.path.isfile(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return None
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"  WARNING: Could not save config: {e}")
+
+
+def find_mt5_terminals():
+    """Scan MetaQuotes Terminal folder for all MT5 installations."""
+    appdata = os.environ.get('APPDATA', '')
+    base    = os.path.join(appdata, 'MetaQuotes', 'Terminal')
+    results = []
+    if not os.path.isdir(base):
+        return results
+    for entry in os.listdir(base):
+        entry_path = os.path.join(base, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        # Check for origin.txt which contains the terminal exe path
+        origin = os.path.join(entry_path, 'origin.txt')
+        tester = os.path.join(entry_path, 'Tester')
+        label  = entry
+        if os.path.isfile(origin):
+            try:
+                with open(origin, 'rb') as f:
+                    raw = f.read()
+                # origin.txt is UTF-16 with BOM on most installs
+                if raw[:2] in (b'\xff\xfe', b'\xfe\xff'):
+                    label = raw.decode('utf-16').strip() or entry
+                else:
+                    label = raw.decode('utf-8', errors='replace').strip() or entry
+            except:
+                pass
+        # Skip folders that don't look like real MT5 terminals
+        if not os.path.isdir(os.path.join(entry_path, 'MQL5')):
+            continue
+        results.append({
+            'id'            : entry,
+            'label'         : label,
+            'tester_folder' : tester,
+            'data_folder'   : entry_path,
+        })
+    return results
+
+
+def pick_terminal():
+    """Let user pick from detected MT5 terminals."""
+    terminals = find_mt5_terminals()
+    if not terminals:
+        print("  No MT5 terminals found in AppData\\MetaQuotes\\Terminal\\")
+        print("  You will need to enter the tester folder path manually.")
+        return None, None
+
+    print()
+    print("  Detected MT5 terminal(s):")
+    for i, t in enumerate(terminals, 1):
+        print(f"    {i}) {t['label']}")
+        print(f"       Tester: {t['tester_folder']}")
+
+    if len(terminals) == 1:
+        choice = input(f"\n  Select terminal [1]: ").strip()
+        idx = 0
+    else:
+        while True:
+            choice = input(f"\n  Select terminal [1-{len(terminals)}]: ").strip()
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(terminals):
+                    break
+            except:
+                pass
+            print("  Invalid selection.")
+
+    selected = terminals[idx]
+    return selected['tester_folder'], selected['label']
+
+
+def find_ea_files(tester_folder):
+    """
+    Scan MQL5/Experts folder for .ex5 files.
+    Returns list of dicts with label (display) and value (ini path).
+    """
+    experts_dir = os.path.join(os.path.dirname(tester_folder), 'MQL5', 'Experts')
+    results = []
+    if not os.path.isdir(experts_dir):
+        return results
+    for root, dirs, files in os.walk(experts_dir):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for fn in sorted(files):
+            if fn.lower().endswith('.ex5'):
+                full_path = os.path.join(root, fn)
+                rel = os.path.relpath(full_path, experts_dir)
+                # Only include EAs in the Market subfolder
+                if rel.startswith('Market' + os.sep) or rel.startswith('Market/'):
+                    results.append({'label': rel, 'value': rel})
+    return results
+
+
+def pick_ea_name(tester_folder, current=None):
+    """List available EAs and let user pick, or enter manually."""
+    eas = find_ea_files(tester_folder)
+
+    if not eas:
+        print("  No .ex5 files found in MQL5/Experts -- enter EA name manually.")
+        return prompt("EA Name", current or DEFAULTS['ea_name'])
+
+    print()
+    print("  Available EAs:")
+    for i, ea in enumerate(eas, 1):
+        marker = ' <' if current and ea['value'] == current else ''
+        print(f"    {i:>3}) {ea['label']}{marker}")
+    print(f"    {len(eas)+1:>3}) Enter manually")
+
+    while True:
+        default_idx = None
+        if current:
+            for i, ea in enumerate(eas, 1):
+                if ea['value'] == current:
+                    default_idx = i
+                    break
+        hint = f"1-{len(eas)+1}" + (f", Enter={default_idx}" if default_idx else "")
+        choice = input(f"  Select EA [{hint}]: ").strip()
+
+        if choice == '' and default_idx:
+            return eas[default_idx - 1]['value']
+        try:
+            idx = int(choice) - 1
+            if idx == len(eas):
+                return prompt("EA Name", current or DEFAULTS['ea_name'])
+            if 0 <= idx < len(eas):
+                return eas[idx]['value']
+        except:
+            pass
+        print("  Invalid selection.")
+
+
+def setup_config():
+    """First-run setup — detect terminals and build config."""
+    print()
+    print("  ── First Run Setup ──────────────────────────────────────")
+
+    tester_folder, terminal_label = pick_terminal()
+
+    if not tester_folder:
+        tester_folder = prompt("Tester folder path")
+
+    terminal_path = prompt("Path to terminal64.exe", DEFAULTS['terminal_path'])
+
+    print()
+    print("  ── Backtest Defaults ────────────────────────────────────")
+    cfg = {
+        'terminal_path' : terminal_path,
+        'tester_folder' : tester_folder,
+        'terminal_label': terminal_label or '',
+        'ea_name'       : pick_ea_name(tester_folder, DEFAULTS['ea_name']),
+        'from_date'     : prompt("From Date (YYYY.MM.DD)", DEFAULTS['from_date']),
+        'to_date'       : prompt("To Date   (YYYY.MM.DD)", DEFAULTS['to_date']),
+        'model'         : prompt("Model (1=OHLC M1, 0=Every tick generated, 4=Every tick REAL ticks, 2=Open prices)", DEFAULTS['model']),
+        'deposit'       : prompt("Deposit", DEFAULTS['deposit']),
+        'currency'      : prompt("Currency", DEFAULTS['currency']),
+        'leverage'      : prompt("Leverage", DEFAULTS['leverage']),
+        'suffix'        : prompt("Instrument suffix (e.g. .a)", DEFAULTS['suffix']),
+    }
+    save_config(cfg)
+    print()
+    print(f"  Config saved to: {CONFIG_FILE}")
+    return cfg
+
+
+def review_config(cfg):
+    """Show saved config and ask to use same or modify."""
+    print()
+    print("  ── Saved Settings ───────────────────────────────────────")
+    print(f"  Terminal : {cfg.get('terminal_label', cfg['tester_folder'])}")
+    print(f"  Tester   : {cfg['tester_folder']}")
+    print(f"  EA       : {cfg['ea_name']}")
+    print(f"  Dates    : {cfg['from_date']} → {cfg['to_date']}")
+    print(f"  Model    : {cfg['model']}  Deposit: {cfg['deposit']} {cfg['currency']}  Leverage: {cfg['leverage']}")
+    print(f"  Suffix   : {cfg['suffix']}")
+    print()
+    choice = input("  Use these settings? [Y/n/reset]: ").strip().lower()
+
+    if choice == 'reset':
+        os.remove(CONFIG_FILE)
+        print("  Config reset — re-running setup.")
+        return setup_config()
+
+    if choice == 'n':
+        print()
+        print("  ── Modify Settings ──────────────────────────────────────")
+        redetect = input("  Re-detect MT5 terminals? [y/N]: ").strip().lower()
+        if redetect == 'y':
+            tester_folder, terminal_label = pick_terminal()
+            if tester_folder:
+                cfg['tester_folder']  = tester_folder
+                cfg['terminal_label'] = terminal_label or ''
+
+        cfg['terminal_path'] = prompt("terminal64.exe path", cfg['terminal_path'])
+        cfg['ea_name']       = pick_ea_name(cfg['tester_folder'], cfg['ea_name'])
+        cfg['from_date']     = prompt("From Date",           cfg['from_date'])
+        cfg['to_date']       = prompt("To Date",             cfg['to_date'])
+        cfg['model']         = prompt("Model (1=OHLC M1, 0=Every tick generated, 4=Every tick REAL ticks, 2=Open prices)", cfg['model'])
+        cfg['deposit']       = prompt("Deposit",             cfg['deposit'])
+        cfg['currency']      = prompt("Currency",            cfg['currency'])
+        cfg['leverage']      = prompt("Leverage",            cfg['leverage'])
+        cfg['suffix']        = prompt("Suffix",              cfg['suffix'])
+        save_config(cfg)
+        print("  Config updated.")
+
+    return cfg
+
+
+# Reversed timeframe tokens seen in filenames, e.g. "..._1H.set"
+TF_REVERSED = {
+    '1H': 'H1', '2H': 'H2', '3H': 'H3', '4H': 'H4',
+    '6H': 'H6', '8H': 'H8', '12H': 'H12', '1D': 'Daily',
+}
+
+
+def detect_timeframe(filename):
+    name = os.path.splitext(filename)[0].upper()
+    # Split on any separator (_ - space . etc.) and match whole tokens,
+    # left to right, so "H1_B" and "BK_B_1H" both resolve
+    for token in re.split(r'[^A-Z0-9]+', name):
+        if token in PERIOD_MAP:
+            return PERIOD_MAP[token]
+        if token in TF_REVERSED:
+            return TF_REVERSED[token]
+    return None
+
+
+def detect_instrument(filename, n_chars):
+    return os.path.splitext(filename)[0][:n_chars].upper()
+
+
+def get_set_param(set_path, key):
+    """Return the first value (before ||) of a parameter in a .set file, or None."""
+    lines, _ = read_utf16(set_path)
+    for line in lines:
+        s = line.strip()
+        if s.startswith(key + '='):
+            return s.split('=', 1)[1].split('||')[0].strip()
+    return None
+
+
+def get_ubs_symbol(set_path):
+    """ForceSymbol from a UBS set file (already includes any suffix), or None."""
+    return get_set_param(set_path, 'ForceSymbol') or None
+
+
+def get_ubs_period(set_path):
+    """
+    Tester Period name from a UBS set file, or None.
+    The timeframe input depends on the strategy selected by Run_Strategy:
+      1 = breakout            -> ST1_Timeframe ('Timeframe To Use')
+      2 = volatility breakout -> VolTimeframe
+      3 = range               -> RNG_Timeframe
+    A value of 0 means 'current chart' and is skipped so callers can fall back.
+    """
+    run_strategy = get_set_param(set_path, 'Run_Strategy')
+    if run_strategy == '2':
+        keys = ('VolTimeframe', 'ST1_Timeframe')
+    elif run_strategy == '3':
+        keys = ('RNG_Timeframe', 'ST1_Timeframe')
+    else:
+        keys = ('ST1_Timeframe',)
+    for key in keys:
+        val = get_set_param(set_path, key)
+        if val and val != '0':
+            period = TF_ENUM_TO_PERIOD.get(val)
+            if period:
+                return period
+    return None
+
+
+def read_utf16(path):
+    with open(path, 'rb') as f:
+        raw = f.read()
+    if raw[:2] == b'\xff\xfe':
+        return raw[2:].decode('utf-16-le').splitlines(), 'utf-16-le'
+    elif raw[:2] == b'\xfe\xff':
+        return raw[2:].decode('utf-16-be').splitlines(), 'utf-16-be'
+    return raw.decode('utf-8', errors='replace').splitlines(), 'utf-8'
+
+
+def write_utf16(path, lines, encoding='utf-16-le'):
+    text = '\r\n'.join(lines) + '\r\n'
+    with open(path, 'wb') as f:
+        if encoding == 'utf-16-le':
+            f.write(b'\xff\xfe'); f.write(text.encode('utf-16-le'))
+        elif encoding == 'utf-16-be':
+            f.write(b'\xfe\xff'); f.write(text.encode('utf-16-be'))
+        else:
+            f.write(text.encode('utf-8'))
+
+
+def _clear_use_default_flags(lines):
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if '=' in stripped and ',' not in stripped.split('=')[0] and '||' in stripped:
+            parts = stripped.split('||')
+            try:
+                flag = int(float(parts[1]))
+                if flag & 4:
+                    parts[1] = str(flag & ~4)
+                    line = '||'.join(parts)
+            except (ValueError, TypeError, IndexError):
+                pass
+        result.append(line)
+    return result
+
+
+def update_set_file(set_path, ea_comment, lot_mode, lot_value):
+    lines, encoding = read_utf16(set_path)
+    lines = _clear_use_default_flags(lines)
+
+    def update_param(lines, key, new_val):
+        # Update existing key — if not found, append it so it is always written
+        for i, line in enumerate(lines):
+            if line.strip().startswith(key + '='):
+                parts = line.strip().split('||')
+                parts[0] = f'{key}={new_val}'
+                lines[i] = '||'.join(parts)
+                return True
+        lines.append(f'{key}={new_val}')
+        return False
+
+    # Always update EA_Comment
+    updated = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith('EA_Comment='):
+            lines[i] = f'EA_Comment={ea_comment}'
+            updated = True
+            break
+    if not updated:
+        lines.append(f'EA_Comment={ea_comment}')
+
+    if lot_mode == 'manual':
+        # Ensure Risk=0 and StartLots are written regardless of original file state
+        update_param(lines, 'Risk', '0')
+        update_param(lines, 'StartLots', str(lot_value))
+        # Clear LotPerBalance_step so balance mode can't leak through
+        for i, line in enumerate(lines):
+            if line.strip().startswith('LotPerBalance_step='):
+                parts = line.strip().split('||')
+                parts[0] = 'LotPerBalance_step=0'
+                lines[i] = '||'.join(parts)
+                break
+    elif lot_mode == 'balance':
+        update_param(lines, 'Risk', '9999')
+        update_param(lines, 'LotPerBalance_step', str(lot_value))
+    # lot_mode None/'asis': only EA_Comment updated
+
+    write_utf16(set_path, lines, encoding)
+
+
+def read_set_lines(set_path):
+    """Read a .set file and return lines as UTF-8 strings."""
+    with open(set_path, 'rb') as f:
+        raw = f.read()
+    if raw[:2] == b'\xff\xfe':
+        return raw[2:].decode('utf-16-le').splitlines()
+    elif raw[:2] == b'\xfe\xff':
+        return raw[2:].decode('utf-16-be').splitlines()
+    return raw.decode('utf-8', errors='replace').splitlines()
+
+
+def build_ini(symbol, period, set_file_path, ini_out_path, report_folder, cfg, report_name=None):
+    if report_name is None:
+        name_stem   = os.path.splitext(os.path.basename(set_file_path))[0]
+        model_label = MODEL_LABELS.get(cfg['model'], f"M{cfg['model']}")
+        report_name = f"{name_stem}_{model_label}"
+
+    # Build [Tester] section
+    tester_section = (
+        '[Tester]\r\n'
+        f'Expert={cfg["ea_name"]}\r\n'
+        f'Symbol={symbol}\r\n'
+        f'Period={period}\r\n'
+        f'Optimization={cfg.get("optimization","0")}\r\n'
+        f'Model={cfg["model"]}\r\n'
+        f'FromDate={cfg["from_date"]}\r\n'
+        f'ToDate={cfg["to_date"]}\r\n'
+        'ForwardMode=0\r\n'
+        f'Deposit={cfg["deposit"]}\r\n'
+        f'Currency={cfg["currency"]}\r\n'
+        'ProfitInPips=0\r\n'
+        f'Leverage={cfg["leverage"]}\r\n'
+        'ExecutionMode=0\r\n'
+        'OptimizationCriterion=0\r\n'
+        'Visual=0\r\n'
+        f'Report={report_name}\r\n'
+        'ReplaceReport=1\r\n'
+        'ShutdownTerminal=1\r\n'
+    )
+
+    # Build [TesterInputs] section directly from set file contents
+    # This guarantees MT5 uses these exact values, bypassing any cached defaults
+    tester_inputs = '[TesterInputs]\r\n'
+    try:
+        set_lines = read_set_lines(set_file_path)
+        for line in set_lines:
+            line = line.strip()
+            if not line or line.startswith(';'):
+                continue
+            if '=' in line:
+                tester_inputs += line + '\r\n'
+    except Exception as e:
+        raise RuntimeError(f"Could not read set file {set_file_path}: {e}")
+
+    with open(ini_out_path, 'wb') as f:
+        f.write((tester_section + tester_inputs).encode('utf-8'))
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("  MT5 Batch Backtest Runner")
+    print("=" * 60)
+
+    # ── Load or create config ──────────────────────────────────────
+    cfg = load_config()
+    if cfg is None:
+        cfg = setup_config()
+    else:
+        cfg = review_config(cfg)
+
+    terminal_path = cfg['terminal_path']
+    tester_folder = cfg['tester_folder']
+    os.makedirs(tester_folder, exist_ok=True)
+
+    if not os.path.isfile(terminal_path):
+        print(f"\n  WARNING: terminal64.exe not found at: {terminal_path}")
+
+    # ── Folder of set files ────────────────────────────────────────
+    print()
+    set_folder = prompt("Path to folder containing .set files")
+    set_folder = os.path.expandvars(set_folder.strip('"').strip("'"))
+    if not os.path.isdir(set_folder):
+        print(f"  ERROR: Folder not found: {set_folder}")
+        sys.exit(1)
+
+    all_set_files = sorted(glob.glob(os.path.join(set_folder, '**', '*.set'), recursive=True))
+    set_files = [f for f in all_set_files
+                 if not _is_optimisation_file(os.path.basename(f))
+                 and '_batch_modified' not in f.replace('\\', '/')]
+    skipped = len(all_set_files) - len(set_files)
+    if not set_files:
+        print("  ERROR: No .set files found (after exclusions).")
+        sys.exit(1)
+    print(f"  Found {len(set_files)} .set file(s).", end='')
+    if skipped:
+        print(f" ({skipped} Optimization file(s) excluded)", end='')
+    print()
+
+    # ── Report output folder ───────────────────────────────────────
+    default_reports = os.path.join(set_folder, 'reports')
+    report_folder = prompt("Path to save reports", default_reports)
+    report_folder = report_folder.strip('"').strip("'")
+    os.makedirs(report_folder, exist_ok=True)
+
+    # ── Lot size mode ──────────────────────────────────────────────
+    print()
+    print("  Lot size mode:")
+    print("    0 = Use set file as-is (no changes to Risk/Lots)")
+    print("    1 = Manual lot size (same for all) — sets Risk=0, StartLots=X")
+    print("    2 = Lots per balance (from each .set file) — sets Risk=9999")
+    print("    3 = Lots per balance (enter per file) — sets Risk=9999")
+    lot_mode_choice = prompt("Choose [0/1/2/3]", "2")
+
+    lot_mode    = {'0': 'asis', '1': 'manual'}.get(lot_mode_choice, 'balance')
+    balance_ask = lot_mode_choice == '3'
+    manual_lots = None
+
+    if lot_mode == 'asis':
+        print("  Set files used as-is — no Risk/Lots changes.")
+    elif lot_mode == 'manual':
+        manual_lots = prompt("StartLots for all files", "0.01")
+    elif balance_ask:
+        print("  Will prompt LotPerBalance_step per file. Risk=9999.")
+    else:
+        print("  Using LotPerBalance_step from each file. Risk=9999.")
+
+    # ── Strategy name & instance ──────────────────────────────────
+    print()
+    strategy_name   = prompt("Strategy name for report filename (blank = use .set stem)", "")
+
+    # ── Detection mode ─────────────────────────────────────────────
+    print()
+    print("  Detection mode:")
+    print("    1 = Auto detect (instrument/timeframe from filename)")
+    print("    2 = UBS set file (ForceSymbol + Timeframe To Use, fallback to auto detect)")
+    detect_mode = prompt("Choose [1/2]", "1")
+
+    instr_mode    = None
+    instr_global  = None
+    instr_n_chars = None
+    tf_mode       = None
+    tf_global     = None
+
+    if detect_mode == '2':
+        instr_mode = 'ubs'
+        tf_mode    = 'ubs'
+        print("  Using ForceSymbol and Timeframe To Use from each set file.")
+    else:
+        # ── Instrument mode ────────────────────────────────────────
+        print()
+        print("  Instrument detection:")
+        print("    1 = Enter one instrument for all set files")
+        print("    2 = Extract from filename (specify number of characters)")
+        print("    3 = Ask per file")
+        instr_mode = prompt("Choose [1/2/3]", "1")
+
+        if instr_mode == '1':
+            instr_global = prompt("Instrument (without suffix, e.g. GBPJPY)").upper()
+        elif instr_mode == '2':
+            instr_n_chars = int(prompt("Characters from start of filename", "6"))
+
+        # ── Timeframe mode ─────────────────────────────────────────
+        print()
+        print("  Timeframe:")
+        print("    1 = One timeframe for all set files")
+        print("    2 = Detect from filename (D/Daily/H1/H4 etc.)")
+        print("    3 = Ask per file")
+        tf_mode = prompt("Choose [1/2/3]", "2")
+
+        if tf_mode == '1':
+            tf_raw    = prompt("Timeframe (e.g. Daily, H1, H4, M15)").upper()
+            tf_global = PERIOD_MAP.get(tf_raw, tf_raw)
+
+    # ── Output folder for modified .set copies ─────────────────────
+    # (subfolders mirrored inside _batch_modified and reports)
+    out_set_base = os.path.join(set_folder, '_batch_modified')
+    os.makedirs(out_set_base, exist_ok=True)
+
+    # ── Process each set file ──────────────────────────────────────
+    print()
+    print("=" * 60)
+    print(f"  Processing {len(set_files)} file(s)...")
+    print("=" * 60)
+
+    results = []
+
+    for set_path in set_files:
+        filename  = os.path.basename(set_path)
+        name_stem = os.path.splitext(filename)[0]
+
+        # Mirror subfolder structure from set_folder root
+        rel_path        = os.path.relpath(set_path, set_folder)
+        rel_subdir      = os.path.dirname(rel_path)
+        out_set_folder  = os.path.join(out_set_base, rel_subdir) if rel_subdir else out_set_base
+        file_report_dir = os.path.join(report_folder, rel_subdir) if rel_subdir else report_folder
+        os.makedirs(out_set_folder, exist_ok=True)
+        os.makedirs(file_report_dir, exist_ok=True)
+
+        subfolder_label = f" ({rel_subdir})" if rel_subdir else ""
+        print(f"\n  [{filename}]{subfolder_label}")
+
+        # Instrument
+        if instr_mode == 'ubs':
+            force_sym = get_ubs_symbol(set_path)
+            if force_sym:
+                # ForceSymbol already includes any suffix — use as-is
+                symbol = force_sym
+                print(f"    Instrument: {symbol} (ForceSymbol)")
+            else:
+                instrument = detect_instrument(filename, 6)
+                symbol = instrument + cfg['suffix']
+                print(f"    Instrument: {instrument} (fallback: filename)")
+        else:
+            if instr_mode == '1':
+                instrument = instr_global
+            elif instr_mode == '2':
+                instrument = detect_instrument(filename, instr_n_chars)
+                print(f"    Instrument: {instrument}")
+            else:
+                instrument = prompt(f"Instrument for {filename} (without suffix)").upper()
+            symbol = instrument + cfg['suffix']
+
+        # Timeframe
+        if tf_mode == 'ubs':
+            period = get_ubs_period(set_path)
+            if period:
+                print(f"    Timeframe : {period} (Timeframe To Use)")
+            else:
+                period = detect_timeframe(filename)
+                if period:
+                    print(f"    Timeframe : {period} (fallback: filename)")
+                else:
+                    tf_raw = prompt(f"Timeframe for {filename} (e.g. Daily, H1, H4)").upper()
+                    period = PERIOD_MAP.get(tf_raw, tf_raw)
+        elif tf_mode == '1':
+            period = tf_global
+        elif tf_mode == '2':
+            period = detect_timeframe(filename)
+            if period:
+                print(f"    Timeframe : {period}")
+            else:
+                tf_raw = prompt(f"Timeframe for {filename} (e.g. Daily, H1, H4)").upper()
+                period = PERIOD_MAP.get(tf_raw, tf_raw)
+        else:
+            tf_raw = prompt(f"Timeframe for {filename}").upper()
+            period = PERIOD_MAP.get(tf_raw, tf_raw)
+
+        # Lot value
+        if lot_mode == 'asis':
+            lot_value = None
+            print(f"    Lots      : as-is")
+        elif lot_mode == 'manual':
+            lot_value = manual_lots
+            print(f"    Lots      : Manual StartLots={lot_value}")
+        else:
+            if balance_ask:
+                file_lines, _ = read_utf16(set_path)
+                file_lot   = None
+                for line in file_lines:
+                    if line.strip().startswith('LotPerBalance_step='):
+                        parts    = line.strip().split('||')
+                        file_lot = parts[0].replace('LotPerBalance_step=', '').strip()
+                        break
+                lot_value = prompt(f"LotPerBalance_step for {filename}", file_lot or "100")
+            else:
+                file_lines, _ = read_utf16(set_path)
+                lot_value  = None
+                for line in file_lines:
+                    if line.strip().startswith('LotPerBalance_step='):
+                        parts     = line.strip().split('||')
+                        lot_value = parts[0].replace('LotPerBalance_step=', '').strip()
+                        break
+                if lot_value is None:
+                    lot_value = prompt(f"LotPerBalance_step not found, enter value", "100")
+            print(f"    Lots      : Balance LotPerBalance_step={lot_value} Risk=9999")
+
+        # EA_Comment / report name
+        model_label = MODEL_LABELS.get(cfg['model'], f"M{cfg['model']}")
+        sym_part    = symbol.replace('.','')
+        if strategy_name.strip():
+            report_name_new = f"{strategy_name.strip()}_{sym_part}_{period}_{model_label}_{name_stem}"
+        else:
+            report_name_new = f"{name_stem}_{model_label}"
+        ea_comment  = report_name_new
+        print(f"    EA_Comment: {ea_comment}")
+
+        # Copy and modify set file
+        modified_set = os.path.join(out_set_folder, filename)
+        shutil.copy2(set_path, modified_set)
+        if lot_mode == 'asis':
+            update_set_file(modified_set, ea_comment, None, None)
+        else:
+            update_set_file(modified_set, ea_comment, lot_mode, lot_value)
+
+        # Write ini
+        report_name = report_name_new
+        ini_path = os.path.join(tester_folder, f"{name_stem}.ini")
+        # MT5 requires the set file to be inside the Tester folder
+        tester_set = os.path.join(tester_folder, filename)
+        shutil.copy2(modified_set, tester_set)
+        build_ini(symbol, period, tester_set, ini_path, report_folder, cfg, report_name=report_name_new)
+        print(f"    INI       : {ini_path}")
+        print(f"    Report as : {report_name}.htm")
+
+        # Launch MT5 minimised
+        # Print ini content so we can see exactly what MT5 receives
+        try:
+            with open(ini_path, 'r', encoding='utf-8') as _f:
+                print(f"    INI content:")
+                for _l in _f: print(f"      {_l.rstrip()}")
+        except Exception as _e:
+            print(f"    WARN: could not read ini: {_e}")
+        cmd = [terminal_path, f'/config:{ini_path}']
+        print(f"    Launching MT5", end='', flush=True)
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 6  # SW_MINIMIZE
+        # Define terminal_data before first use
+        terminal_data = os.path.dirname(tester_folder)
+        run_start = time.time()
+        proc = subprocess.Popen(cmd, startupinfo=si)
+        while proc.poll() is None:
+            time.sleep(10)
+            print('.', end='', flush=True)
+        print(f" done (exit {proc.returncode})")
+
+        # MT5 writes the .htm report with the bare report_name into one of several
+        # possible locations. Search all of them, newest-first, then move to reports folder.
+        htm_dest = os.path.join(file_report_dir, report_name + '.htm')
+
+        # All directories MT5 might drop the report into
+        search_roots = [
+            terminal_data,
+            tester_folder,
+            os.path.join(terminal_data, 'MQL5', 'Profiles', 'Tester'),
+            os.path.join(terminal_data, 'reports'),
+            os.path.join(terminal_data, 'MQL5', 'Logs'),
+        ]
+
+        # 1. Look for exact name match newer than run_start
+        src_htm = None
+        for root in search_roots:
+            if not os.path.isdir(root):
+                continue
+            candidate = os.path.join(root, report_name + '.htm')
+            if os.path.isfile(candidate):
+                try:
+                    if os.path.getmtime(candidate) >= run_start:
+                        src_htm = candidate
+                        break
+                except OSError:
+                    pass
+
+        # 2. Fallback: any .htm newer than run_start anywhere under terminal_data
+        if src_htm is None:
+            newest_time = run_start - 1
+            for dirpath, _, filenames in os.walk(terminal_data):
+                for fn in filenames:
+                    if fn.lower().endswith('.htm'):
+                        fp = os.path.join(dirpath, fn)
+                        try:
+                            mt = os.path.getmtime(fp)
+                            if mt > newest_time:
+                                newest_time = mt
+                                src_htm = fp
+                        except OSError:
+                            pass
+
+        success = False
+        if src_htm:
+            try:
+                shutil.move(src_htm, htm_dest)
+                success = True
+                src_label = os.path.basename(os.path.dirname(src_htm))
+                print(f"    Report    : {report_name}.htm (from ...{src_label}) → {file_report_dir}")
+            except Exception as e:
+                print(f"    FAIL      : Could not move report: {e}")
+        else:
+            print(f"    FAIL      : No HTM report found after run. Searched: {[r for r in search_roots if os.path.isdir(r)]}")
+
+        # Move companion PNGs regardless of htm success
+        # MT5 names them: report_name.png, report_name-holding.png,
+        #                  report_name-mfemae.png, report_name-hst.png
+        for suffix in ('', '-holding', '-mfemae', '-hst'):
+            png_name = report_name + suffix + '.png'
+            for root in search_roots:
+                src_png = os.path.join(root, png_name)
+                if os.path.isfile(src_png):
+                    try:
+                        shutil.move(src_png, os.path.join(file_report_dir, png_name))
+                    except Exception as e:
+                        print(f"    WARN      : Could not move {png_name}: {e}")
+                    break
+
+        results.append({
+            'file'    : filename,
+            'subfolder': rel_subdir,
+            'symbol'  : symbol,
+            'period'  : period,
+            'success' : success,
+        })
+
+    # ── Summary ────────────────────────────────────────────────────
+    print()
+    print("=" * 60)
+    print("  SUMMARY")
+    print("=" * 60)
+    passed = [r for r in results if r['success']]
+    failed = [r for r in results if not r['success']]
+    print(f"  Completed: {len(passed)}/{len(results)}")
+    if failed:
+        print(f"\n  Failed (no report generated):")
+        for r in failed:
+            subfolder = f" [{r['subfolder']}]" if r.get('subfolder') else ""
+            print(f"    - {r['file']}{subfolder} ({r['symbol']} {r['period']})")
+        failed_log = os.path.join(report_folder, 'failed_backtests.txt')
+        with open(failed_log, 'w') as f:
+            for r in failed:
+                f.write(f"{r['file']}\t{r['symbol']}\t{r['period']}\n")
+        print(f"\n  Failed list saved to: {failed_log}")
+    print()
+
+
+if __name__ == '__main__':
+    main()

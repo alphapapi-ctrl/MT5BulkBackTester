@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+mt5_batch_config.json
+batch_runs/
+reports/
+OptimisationReport/
+_batch_modified/
+*.set
+*.ex5
+*.log
+.streamlit/secrets.toml
