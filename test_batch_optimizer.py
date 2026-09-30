@@ -36,7 +36,9 @@ class OptimizerTests(unittest.TestCase):
             folder = self.source.parent / name
             folder.mkdir()
             (folder / 'copy.set').write_bytes(self.original)
-        self.assertEqual(opt.discover_sets(self.root / 'sets'), [str(self.source)])
+        # Windows temporary paths can use 8.3 aliases (for example RUNNER~1).
+        # Discovery returns resolved paths, so compare the same representation.
+        self.assertEqual(opt.discover_sets(self.root / 'sets'), [str(self.source.resolve())])
         self.assertEqual(opt.discover_sets(self.root / 'sets', False), [])
 
     def test_ini_uses_optimization_and_preserves_source(self):
