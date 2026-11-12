@@ -61,12 +61,12 @@ def render_progress():
 
 def render():
     st.title('Batch Optimizer')
-    render_optimizer_logs()
     st.caption('Run MT5 optimizations from .set files. XML reports are saved in an '
                'OptimisationReport subfolder beside each source set.')
     run = st.session_state.get('bo_run')
     if run is not None and run.thread.is_alive():
         render_progress()
+        render_optimizer_logs()
         st.button('Refresh batch controls', key='bo_refresh')
         return
 
@@ -102,7 +102,7 @@ def render():
         help='The report name includes a fingerprint of the set contents and run settings.')
     timeout = st.number_input('Time limit per set (hours)', min_value=1, max_value=720, value=24, key='bo_timeout')
     verbose = st.toggle('Verbose session logging', value=False, key='bo_verbose',
-        help='Every run saves milestones and errors. Verbose mode also captures new MT5 journal lines. View or download logs at the top of this page.')
+        help='Every run saves milestones and errors. Verbose mode also captures new MT5 journal lines. View or download logs below the results.')
     mode = st.radio('Symbol and timeframe', ['Read UBS inputs / filename', 'Use defaults for all files'],
                     horizontal=True, key='bo_detection')
     col1, col2 = st.columns(2)
@@ -171,3 +171,4 @@ def render():
     elif folder:
         st.info('No .set files found.')
     render_progress()
+    render_optimizer_logs()

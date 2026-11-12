@@ -65,7 +65,7 @@ The application is derived from the batch modules in [MT5 Tools](https://github.
 
 ### Dashboard session diagnostics
 
-Every dashboard Batch Backtester and Batch Optimizer run writes `batch_runs/<timestamp_id>/session.log`, including setup, working-file creation, terminal launch/PID, periodic running status, exit code, report search and copy outcomes, and error tracebacks. Open **Session logs** at the top of the backtest page to view previous/current sessions or download a log. Logs persist across app restarts.
+Every dashboard Batch Backtester and Batch Optimizer run writes `batch_runs/<timestamp_id>/session.log`, including setup, working-file creation, terminal launch/PID, periodic running status, exit code, report search and copy outcomes, and error tracebacks. Open **Session logs** below the results on either batch page to view previous/current sessions or download a log. Logs persist across app restarts.
 
 Enable **Verbose session logging** before starting for newly appended MT5 journal lines as well as the normal milestones. Terminal, Tester and local Agent journals under the configured terminal data folder are monitored; old journal content is not replayed. Login is only reported when an authorization success is observed, and symbol synchronization only when the requested symbol has a success journal entry. Missing evidence is labelled unconfirmed, not failed. This does not log into accounts or query/change Market Watch. Other agent log locations may require manual inspection.
 

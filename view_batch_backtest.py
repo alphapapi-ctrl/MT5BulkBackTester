@@ -542,7 +542,6 @@ def _run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
 
 def render():
     st.title("📋 Batch Backtest")
-    render_session_logs()
     optimizer = st.session_state.get('bo_run')
     if optimizer is not None and optimizer.thread.is_alive():
         st.info("Batch Optimizer is running. Wait for it to finish before starting backtests.")
@@ -920,7 +919,7 @@ def render():
 
     verbose_logging = st.toggle('Verbose session logging', value=False,
         disabled=st.session_state['bb_running'],
-        help='Every run records milestones and errors. Verbose mode also records new terminal and tester journal lines. Logs are available at the top of this page and saved under batch_runs.')
+        help='Every run records milestones and errors. Verbose mode also records new terminal and tester journal lines. Logs are available below the results and saved under batch_runs.')
     col_run, col_stop = st.columns([2, 1])
 
     with col_run:
@@ -968,9 +967,6 @@ def render():
             total = st.session_state.get('bb_total') or len(set_files)
             st.progress(min(done / total, 1.0) if total else 0.0,
                         text=f"{done} / {total} complete")
-            time.sleep(2)
-            st.rerun()
-
         results = st.session_state['bb_results']
         if results:
             status_icon = {
@@ -1006,8 +1002,17 @@ def render():
             st.success(f"Batch complete — {done} succeeded, {failed} failed")
             st.caption("Reports saved to reports/ subfolder next to each set file")
 
+        render_session_logs()
+
+        if st.session_state['bb_complete']:
             if st.button("🔄 Clear & Run Another"):
                 st.session_state['bb_results']  = []
                 st.session_state['bb_complete'] = False
                 st.session_state['bb_running']  = False
                 st.rerun()
+
+        if st.session_state['bb_running']:
+            time.sleep(2)
+            st.rerun()
+    else:
+        render_session_logs()
