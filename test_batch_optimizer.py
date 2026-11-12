@@ -58,7 +58,7 @@ class OptimizerTests(unittest.TestCase):
         self.source.write_bytes(self.original + 'Extra=1\r\n'.encode('utf-16-le'))
         self.assertNotEqual(original, opt.report_path(self.job, self.cfg))
 
-    def run_fake(self, export=True, skip=False, stopped=False, timeout=False):
+    def run_fake(self, export=True, skip=False, stopped=False, timeout=False, logging=False, verbose=False):
         events, stop = queue.Queue(), threading.Event()
         if stopped:
             stop.set()
@@ -69,6 +69,10 @@ class OptimizerTests(unittest.TestCase):
             self.assertEqual(staged.read_bytes(), self.original)
             if export:
                 (self.data / (fields['Report'] + '.xml')).write_text(XML)
+            logs = self.data / 'Logs'
+            logs.mkdir(exist_ok=True)
+            with (logs / 'test.log').open('a') as journal:
+                journal.write('account authorized\nEURUSD.a synchronized\nordinary detail\n')
             class Process:
                 returncode = 0
                 alive = timeout
@@ -76,12 +80,47 @@ class OptimizerTests(unittest.TestCase):
                 def terminate(self): self.alive = False
                 def wait(self, timeout=None): return self.returncode
             return Process()
-        with patch.object(opt, 'terminal_running', return_value=False), patch.object(opt.subprocess, 'Popen', side_effect=launch) as popen:
-            opt.run_batch([self.job], self.cfg, events, stop, skip, 0 if timeout else 1)
+        from batch_diagnostics import SessionLog
+        self.log = SessionLog(root=self.root / 'logs', verbose=verbose)
+        with patch.object(opt, 'SessionLog', return_value=self.log), patch.object(opt, 'terminal_running', return_value=False), patch.object(opt.subprocess, 'Popen', side_effect=launch) as popen:
+            opt.run_batch([self.job], self.cfg, events, stop, skip, 0 if timeout else 1,
+                          session_logging=logging, verbose_logging=verbose)
         result = []
         while not events.empty(): result.append(events.get_nowait())
         self.assertEqual(self.source.read_bytes(), self.original)
         return result, popen.call_count
+
+    def test_session_logging_success_and_verbose(self):
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose):
+                self.run_fake(logging=True, verbose=verbose)
+                text = self.log.path.read_text()
+                self.assertIn('Terminal process launched successfully', text)
+                self.assertIn('Account login reported', text)
+                self.assertIn('Symbol data synchronization reported', text)
+                self.assertIn('Report saved', text)
+                self.assertEqual('ordinary detail' in text, verbose)
+
+    def test_session_logging_failure_timeout_skip_and_stop(self):
+        for options, expected in [
+            ({'export': False}, 'No valid optimize report'),
+            ({'export': False, 'timeout': True}, 'Time limit reached'),
+            ({'stopped': True}, 'Stop requested'),
+        ]:
+            with self.subTest(options=options):
+                events, _ = self.run_fake(logging=True, **options)
+                self.assertEqual(events[-1]['status'], 'complete')
+                self.assertIn(expected, self.log.path.read_text())
+        self.run_fake()
+        _, calls = self.run_fake(logging=True, skip=True)
+        self.assertEqual(calls, 0)
+        self.assertIn('Matching report already exists', self.log.path.read_text())
+
+    def test_dashboard_enables_logging(self):
+        with patch.object(opt.threading, 'Thread') as thread:
+            opt.BatchRun().start([self.job], self.cfg, verbose_logging=True)
+        self.assertEqual(thread.call_args.kwargs['kwargs'],
+                         {'session_logging': True, 'verbose_logging': True})
 
     def test_runner_collects_xml_and_cleans_staged_files(self):
         events, calls = self.run_fake()

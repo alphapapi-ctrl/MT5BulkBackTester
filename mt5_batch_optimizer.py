@@ -11,6 +11,8 @@ import subprocess
 import threading
 import time
 import uuid
+import traceback
+from batch_diagnostics import SessionLog, JournalWatch
 import xml.etree.ElementTree as ET
 
 from mt5_batch_backtest import MODEL_MIGRATE, TF_ENUM_TO_PERIOD, PERIOD_MAP
@@ -151,33 +153,55 @@ class BatchRun:
         self.stop = threading.Event()
         self.thread = None
 
-    def start(self, jobs, cfg, skip_existing=False, timeout_hours=24):
+    def start(self, jobs, cfg, skip_existing=False, timeout_hours=24, verbose_logging=False):
         self.thread = threading.Thread(target=run_batch,
-            args=(jobs, dict(cfg), self.events, self.stop, skip_existing, timeout_hours), daemon=True)
+            args=(jobs, dict(cfg), self.events, self.stop, skip_existing, timeout_hours),
+            kwargs={'session_logging': True, 'verbose_logging': verbose_logging}, daemon=True)
         self.thread.start()
 
 
-def run_batch(jobs, cfg, events, stop, skip_existing=False, timeout_hours=24, mode='optimize'):
+def run_batch(jobs, cfg, events, stop, skip_existing=False, timeout_hours=24, mode='optimize',
+              session_logging=False, verbose_logging=False):
+    log = None
+    def record(level, message):
+        if log is not None:
+            try:
+                log.write(level, message)
+            except OSError:
+                pass  # Log disk errors must not interrupt an owned MT5 process.
+    def emit(event):
+        state = event['status']
+        record('ERROR' if state in ('failed', 'error') else 'INFO',
+               f"{state}: {event.get('file', '')} {event.get('message', '')} report={event.get('report', '-')} stopped={event.get('stopped', False)}")
+        events.put(event)
     try:
+        if session_logging:
+            log = SessionLog(verbose=verbose_logging)
+            record('INFO', f"Batch {mode}: {len(jobs)} sets; dates {cfg.get('from_date')} to {cfg.get('to_date')}; model={cfg.get('model')}; method={cfg.get('optimization')}; criterion={cfg.get('optimization_criterion')}; timeout={timeout_hours}h; verbose={verbose_logging}")
+            record('INFO', f"Terminal: {cfg.get('terminal_path')}; Tester folder: {cfg.get('tester_folder')}; EA: {cfg.get('ea_name')}")
         terminal = Path(cfg['terminal_path'])
         data = Path(cfg['tester_folder']).parent
         profiles = data / 'MQL5' / 'Profiles' / 'Tester'
         for idx, job in enumerate(jobs):
             if stop.is_set():
+                record('INFO', 'Stop requested; no further sets will launch.')
                 break
             status = {'idx': idx, 'file': job['path']}
             generated = []
             proc = None
+            watcher = None
             try:
+                record('INFO', f"Preparing {job['path']}: symbol={job['symbol']}; timeframe={job['period']}")
                 validate_job(job, cfg, mode)
                 destination = report_path(job, cfg, mode)
                 if skip_existing and valid_report(destination, mode):
-                    events.put(dict(status, status='skipped', message='Matching report already exists', report=str(destination)))
+                    emit(dict(status, status='skipped', message='Matching report already exists', report=str(destination)))
                     continue
                 if not terminal.is_file() or not (data / 'MQL5').is_dir():
                     raise ValueError('Check the terminal executable and Tester folder in Active Config.')
                 if terminal_running(str(terminal)):
                     raise RuntimeError('The selected MT5 terminal is already open. Close it before starting a batch.')
+                record('INFO', 'Terminal executable and data folder found; selected terminal is not already running.')
                 profiles.mkdir(parents=True, exist_ok=True)
                 token = 'batch_opt_' + uuid.uuid4().hex
                 staged = profiles / (token + '.set')
@@ -185,27 +209,44 @@ def run_batch(jobs, cfg, events, stop, skip_existing=False, timeout_hours=24, mo
                 generated.extend([staged, ini])
                 shutil.copy2(job['path'], staged)  # Preserve every byte, including ranges and flags.
                 ini.write_bytes(build_ini(job, cfg, staged.name, token, mode).encode('utf-16'))
-                events.put(dict(status, status='running', message='Optimizing…' if mode == 'optimize' else 'Backtesting…'))
+                record('INFO', f'Working set and INI staged: {staged}; {ini}')
+                emit(dict(status, status='running', message='Optimizing…' if mode == 'optimize' else 'Backtesting…'))
+                if log is not None:
+                    watcher = JournalWatch(data, log, job['symbol'])
                 si = subprocess.STARTUPINFO()
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 si.wShowWindow = 6
                 proc = subprocess.Popen([str(terminal), f'/config:{ini}'], startupinfo=si)
+                record('INFO', f'Terminal process launched successfully; PID={getattr(proc, "pid", "unknown")}. Login checked separately via journal.')
+                heartbeat = time.monotonic()
                 deadline = time.monotonic() + timeout_hours * 3600
                 while proc.poll() is None:
+                    if watcher is not None:
+                        try:
+                            watcher.poll()
+                        except OSError as exc:
+                            record('WARNING', f'Journal capture interrupted: {exc}')
+                    if time.monotonic() - heartbeat >= 60:
+                        record('INFO', f"Terminal still running: {job['path']}; stop after current={stop.is_set()}")
+                        heartbeat = time.monotonic()
                     if time.monotonic() >= deadline:
+                        record('ERROR', 'Time limit reached; terminating the owned terminal.')
                         proc.terminate()
                         proc.wait(timeout=30)
                         raise TimeoutError('Optimization exceeded the configured time limit.')
                     time.sleep(1)
+                record('INFO' if proc.returncode == 0 else 'ERROR', f'Terminal exited: code={proc.returncode}')
                 if proc.returncode:
                     raise RuntimeError(f'MT5 exited with code {proc.returncode}. Check its tester journal.')
                 extension = '.xml' if mode == 'optimize' else '.htm'
                 candidates = list(dict.fromkeys(
                     folder / (token + extension) for folder in
                     [data, terminal.parent, profiles, Path(cfg['tester_folder'])]))
+                record('INFO', f'Searching for valid {mode} report in {candidates}')
                 source = next((p for p in candidates if valid_report(p, mode)), None)
                 if source is None:
                     raise RuntimeError(f'No valid {mode} report was produced. Check the MT5 tester journal.')
+                record('INFO', f'Valid report located: {source}; bytes={source.stat().st_size}')
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 temporary = destination.with_suffix('.' + token + '.tmp')
                 generated.append(temporary)
@@ -226,19 +267,27 @@ def run_batch(jobs, cfg, events, stop, skip_existing=False, timeout_hours=24, mo
                     shutil.copy2(source, temporary)
                 os.replace(temporary, destination)
                 generated.extend([source, *companions])
-                events.put(dict(status, status='done', message='Report saved', report=str(destination)))
+                emit(dict(status, status='done', message='Report saved', report=str(destination)))
             except Exception as exc:
-                events.put(dict(status, status='failed', message=str(exc)))
+                record('ERROR', traceback.format_exc())
+                emit(dict(status, status='failed', message=str(exc)))
                 # Never launch another terminal if an owned process could still be running.
                 if proc is not None and proc.poll() is None:
                     break
             finally:
+                if watcher is not None:
+                    try:
+                        watcher.finish()
+                    except OSError as exc:
+                        record('WARNING', f'Journal capture could not finish: {exc}')
                 for path in generated:
                     try:
                         path.unlink(missing_ok=True)
                     except OSError:
                         pass
     except Exception as exc:
-        events.put({'status': 'error', 'message': str(exc)})
+        record('ERROR', traceback.format_exc())
+        emit({'status': 'error', 'message': str(exc)})
     finally:
-        events.put({'status': 'complete', 'stopped': stop.is_set()})
+        record('INFO', 'Session finished.')
+        emit({'status': 'complete', 'stopped': stop.is_set()})

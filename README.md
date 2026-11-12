@@ -62,3 +62,11 @@ Automated tests use simulated MT5 jobs and never launch a real terminal.
 `mt5_batch_config.json` is created on setup and ignored by Git, along with reports, logs, sets and EA binaries. No personal terminal configuration is distributed. If no report appears, check terminal/data-folder pairing, EA path, broker symbol, available history and the tester journal. Keep enough disk space for reports and MT5 history.
 
 The application is derived from the batch modules in [MT5 Tools](https://github.com/alphapapi-ctrl/mt5-tools). Portfolio, trade-analysis and live-account modules are not included.
+
+### Dashboard session diagnostics
+
+Every dashboard Batch Backtester and Batch Optimizer run writes `batch_runs/<timestamp_id>/session.log`, including setup, working-file creation, terminal launch/PID, periodic running status, exit code, report search and copy outcomes, and error tracebacks. Open **Session logs** at the top of the backtest page to view previous/current sessions or download a log. Logs persist across app restarts.
+
+Enable **Verbose session logging** before starting for newly appended MT5 journal lines as well as the normal milestones. Terminal, Tester and local Agent journals under the configured terminal data folder are monitored; old journal content is not replayed. Login is only reported when an authorization success is observed, and symbol synchronization only when the requested symbol has a success journal entry. Missing evidence is labelled unconfirmed, not failed. This does not log into accounts or query/change Market Watch. Other agent log locations may require manual inspection.
+
+Common credential values and long numeric identifiers are masked, but paths and EA-generated messages can still contain private information: review downloads before sharing. Session folders stay excluded from Git. CLI runs retain their existing `events.jsonl` logging; the session log viewer is shared by both dashboard batch pages. Optimizer logs also record method/criterion, timeouts, matching-report skips and stop-after-current status.

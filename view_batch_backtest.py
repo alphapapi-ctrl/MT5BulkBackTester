@@ -17,6 +17,9 @@ import subprocess
 import time
 import threading
 import queue
+import traceback
+from pathlib import Path
+from batch_diagnostics import SessionLog, JournalWatch
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -295,9 +298,67 @@ def get_lot_value_from_file(set_path):
 
 # ── Background batch runner ───────────────────────────────────────────────────
 
+def render_session_logs(key_prefix='bb'):
+    """Available even before a settings folder is selected, and after a restart."""
+    with st.expander("Session logs — errors and terminal diagnostics", expanded=False):
+        root = Path(__file__).resolve().parent / 'batch_runs'
+        logs = sorted(root.glob('*/session.log'), reverse=True) if root.exists() else []
+        if not logs:
+            st.caption("Each new dashboard batch saves a session log here, including errors even when verbose logging is off.")
+            return
+        selected = st.selectbox("Run log", logs, format_func=lambda path: path.parent.name,
+                                key=key_prefix + '_log_selection')
+        st.caption(str(selected))
+        try:
+            # Keep live rendering bounded. The download contains the full file.
+            with selected.open('rb') as source:
+                source.seek(0, 2)
+                size = source.tell()
+                source.seek(max(0, size - 150000))
+                tail = source.read().decode('utf-8', errors='replace')
+            if size > 150000:
+                tail = '[Showing the latest 150 KB; download for the complete session.]\n' + tail
+            st.code(tail, language='text')
+            st.download_button("Download session log", data=selected.read_bytes(),
+                               file_name=selected.parent.name + '.log', mime='text/plain')
+            st.button("Refresh log", key=key_prefix + '_refresh_log')
+            st.caption("Logs mask common credentials and long numeric identifiers. Review paths and EA messages before sharing.")
+        except OSError as exc:
+            st.warning(f"Could not read this log: {exc}")
+
+
 def run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
               instruments, periods, strategy_name, progress_queue,
-              skip_existing=False, ubs_mode=False):
+              skip_existing=False, ubs_mode=False, verbose_logging=False):
+    """Own the session lifecycle even if setup fails before the first job."""
+    log = None
+    try:
+        log = SessionLog(verbose=verbose_logging)
+        log.write('INFO', f'Batch plan: {len(set_files)} sets; dates {cfg.get("from_date")} to {cfg.get("to_date")}; model {cfg.get("model")}; verbose={verbose_logging}')
+        log.write('INFO', f'Terminal: {cfg.get("terminal_path")}; Tester folder: {cfg.get("tester_folder")}; EA: {cfg.get("ea_name")}')
+        class LoggedQueue:
+            def put(self, event):
+                state = event.get('status', 'info')
+                log.write('ERROR' if state in ('failed', 'error') else 'INFO',
+                          f'{state}: {event.get("file", "")} {event.get("symbol", "")} {event.get("period", "")} {event.get("message", "")} report={event.get("report") or "-"}')
+                progress_queue.put(event)
+        _run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
+                   instruments, periods, strategy_name, LoggedQueue(), skip_existing, ubs_mode, log)
+    except Exception:
+        detail = traceback.format_exc()
+        if log:
+            log.write('ERROR', detail)
+        progress_queue.put({'idx': -1, 'file': '(batch setup)', 'status': 'error',
+                            'message': 'Batch could not start: ' + detail.splitlines()[-1]})
+    finally:
+        if log:
+            log.write('INFO', 'Session finished.')
+        progress_queue.put({'status': 'complete'})
+
+
+def _run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
+              instruments, periods, strategy_name, progress_queue,
+              skip_existing=False, ubs_mode=False, log=None):
     """
     Runs in a background thread.
     Sends progress updates via progress_queue as dicts.
@@ -344,7 +405,14 @@ def run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
             'message' : f"Running backtest...",
         })
 
+        watcher = None
         try:
+            log.write('INFO', f'Preparing {set_path}: symbol={symbol}; timeframe={period}')
+            if not os.path.isfile(terminal_path):
+                raise FileNotFoundError(f'Terminal executable missing: {terminal_path}')
+            if not os.path.isdir(tester_folder):
+                raise FileNotFoundError(f'Tester folder missing: {tester_folder}')
+            log.write('INFO', 'Terminal executable and Tester folder found.')
             # Copy and modify set file
             rel_path   = os.path.relpath(set_path, set_folder)
             rel_subdir = os.path.dirname(rel_path)
@@ -381,6 +449,9 @@ def run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
             shutil.copy2(modified_set, tester_set)
             build_ini(symbol, period, tester_set, ini_path, report_name, cfg)
 
+            log.write('INFO', f'Working set prepared: {modified_set}; tester INI written: {ini_path}')
+            watcher = JournalWatch(terminal_data, log, symbol)
+            started = time.monotonic()
             # Launch MT5 minimised
             si = subprocess.STARTUPINFO()
             si.dwFlags    |= subprocess.STARTF_USESHOWWINDOW
@@ -390,9 +461,17 @@ def run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
                 startupinfo=si
             )
 
-            # Wait for completion
+            log.write('INFO', f'Terminal process launched successfully; PID={proc.pid}. Login is checked separately via the journal.')
+            heartbeat = time.monotonic()
+            # Wait for completion while collecting diagnostic evidence.
             while proc.poll() is None:
+                watcher.poll()
+                if time.monotonic() - heartbeat >= 60:
+                    log.write('INFO', f'Terminal still running: {filename}; elapsed {int(time.monotonic() - started)} seconds')
+                    heartbeat = time.monotonic()
                 time.sleep(5)
+            watcher.finish()
+            log.write('INFO' if proc.returncode == 0 else 'ERROR', f'Terminal exited: code={proc.returncode}; elapsed={time.monotonic() - started:.1f}s')
 
             # Find and copy report
             search_dirs = [
@@ -401,11 +480,13 @@ def run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
                 tester_folder,
             ]
 
+            log.write('INFO', f'Searching for report {report_name}.htm in {search_dirs}')
             success    = False
             report_out = None
             for search_dir in search_dirs:
                 htm_src = os.path.join(search_dir, report_name + '.htm')
                 if os.path.isfile(htm_src):
+                    log.write('INFO', f'Report located: {htm_src}; bytes={os.path.getsize(htm_src)}')
                     htm_dest = os.path.join(rep_dir, report_name + '.htm')
                     shutil.copy2(htm_src, htm_dest)
                     report_out = htm_dest
@@ -427,6 +508,8 @@ def run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
                     success = True
                     break
 
+            if not success:
+                log.write('ERROR', 'No report produced. Review journal errors above for authorization, symbol/history, EA loading or terminal/data-folder issues.')
             progress_queue.put({
                 'idx'       : idx,
                 'total'     : len(set_files),
@@ -440,6 +523,9 @@ def run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
             })
 
         except Exception as e:
+            log.write('ERROR', traceback.format_exc())
+            if watcher is not None:
+                watcher.finish()
             progress_queue.put({
                 'idx'     : idx,
                 'total'   : len(set_files),
@@ -450,13 +536,13 @@ def run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
                 'message' : str(e),
             })
 
-    progress_queue.put({'status': 'complete'})
 
 
 # ── Main render ───────────────────────────────────────────────────────────────
 
 def render():
     st.title("📋 Batch Backtest")
+    render_session_logs()
     optimizer = st.session_state.get('bo_run')
     if optimizer is not None and optimizer.thread.is_alive():
         st.info("Batch Optimizer is running. Wait for it to finish before starting backtests.")
@@ -824,7 +910,7 @@ def render():
                 results = st.session_state['bb_results']
                 found   = False
                 for r in results:
-                    if r['file'] == update['file']:
+                    if r.get('idx') == update.get('idx'):
                         r.update(update)
                         found = True
                         break
@@ -832,6 +918,9 @@ def render():
                     results.append(update)
                 st.session_state['bb_results'] = results
 
+    verbose_logging = st.toggle('Verbose session logging', value=False,
+        disabled=st.session_state['bb_running'],
+        help='Every run records milestones and errors. Verbose mode also records new terminal and tester journal lines. Logs are available at the top of this page and saved under batch_runs.')
     col_run, col_stop = st.columns([2, 1])
 
     with col_run:
@@ -856,7 +945,7 @@ def render():
                     target = run_batch,
                     args   = (set_files, set_folder, cfg, report_folder, lot_mode,
                                lot_values, instruments, periods, strategy_name, q,
-                               skip_existing, ubs_mode),
+                               skip_existing, ubs_mode, verbose_logging),
                     daemon = True
                 )
                 st.session_state['bb_thread'] = t

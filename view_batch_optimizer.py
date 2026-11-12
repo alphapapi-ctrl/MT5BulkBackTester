@@ -11,9 +11,14 @@ import re
 import streamlit as st
 
 from mt5_batch_backtest import DEFAULTS, get_ubs_symbol, get_ubs_period, detect_timeframe
-from view_batch_backtest import load_config, render_config_form
+from view_batch_backtest import load_config, render_config_form, render_session_logs
 from mt5_batch_optimizer import (BatchRun, METHODS, CRITERIA, PERIODS, discover_sets,
                                  optimized_inputs, report_path, validate_job)
+
+
+@st.fragment(run_every='2s')
+def render_optimizer_logs():
+    render_session_logs(key_prefix='bo')
 
 
 @st.fragment(run_every='2s')
@@ -56,6 +61,7 @@ def render_progress():
 
 def render():
     st.title('Batch Optimizer')
+    render_optimizer_logs()
     st.caption('Run MT5 optimizations from .set files. XML reports are saved in an '
                'OptimisationReport subfolder beside each source set.')
     run = st.session_state.get('bo_run')
@@ -95,6 +101,8 @@ def render():
     skip = col2.toggle('Skip matching existing XML reports', value=True, key='bo_skip',
         help='The report name includes a fingerprint of the set contents and run settings.')
     timeout = st.number_input('Time limit per set (hours)', min_value=1, max_value=720, value=24, key='bo_timeout')
+    verbose = st.toggle('Verbose session logging', value=False, key='bo_verbose',
+        help='Every run saves milestones and errors. Verbose mode also captures new MT5 journal lines. View or download logs at the top of this page.')
     mode = st.radio('Symbol and timeframe', ['Read UBS inputs / filename', 'Use defaults for all files'],
                     horizontal=True, key='bo_detection')
     col1, col2 = st.columns(2)
@@ -156,7 +164,7 @@ def render():
                     run = BatchRun()
                     st.session_state.update(bo_run=run, bo_results={}, bo_total=len(jobs),
                                             bo_complete=False, bo_stopped=False, bo_error='')
-                    run.start(jobs, cfg, skip, timeout)
+                    run.start(jobs, cfg, skip, timeout, verbose_logging=verbose)
                     st.rerun()
                 except (ValueError, OSError) as exc:
                     st.error(str(exc))
