@@ -249,7 +249,21 @@ def read_set_lines(set_path):
     return lines
 
 
+def safe_report_name(label):
+    """A report label is a filename, never a path supplied by a UI field."""
+    name = re.sub(r'[<>:"/\\|?*\s\x00-\x1f]', '_', label).strip('. ')
+    if len(name) > 160:
+        import hashlib
+        name = name[:140] + '_' + hashlib.sha256(label.encode()).hexdigest()[:12]
+    if not name or name.split('.')[0].upper() in (
+            'CON', 'PRN', 'AUX', 'NUL', *[f'COM{i}' for i in range(1, 10)],
+            *[f'LPT{i}' for i in range(1, 10)]):
+        name = 'report_' + name
+    return name
+
+
 def build_ini(symbol, period, set_file_path, ini_out_path, report_name, cfg):
+    report_name = safe_report_name(report_name)
     # Build [Tester] section
     tester_section = (
         '[Tester]\r\n'
@@ -392,7 +406,7 @@ def _run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
         lot_value   = lot_values[idx]
         model_label = MODEL_LABELS.get(cfg['model'], f"M{cfg['model']}")
         ea_comment  = f"{strategy_name + ' ' if strategy_name else ''}{name_stem} {symbol} {period} {model_label}"
-        report_name = ea_comment.replace(' ', '_')
+        report_name = safe_report_name(ea_comment)
 
         # Resume support: skip sets whose report already exists (report name
         # includes the model label, so e.g. OHLC reports never mask a tick rerun)
@@ -491,6 +505,7 @@ def _run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
             # Find and copy report
             search_dirs = [
                 terminal_data,
+                os.path.dirname(terminal_path),
                 os.path.join(terminal_data, 'MQL5', 'Profiles', 'Tester'),
                 tester_folder,
             ]
@@ -857,7 +872,7 @@ def render():
         ea_preview = (f"{strategy_name + ' ' if strategy_name else ''}"
                       f"{stem} {row['Symbol']} {row['Period']} {ml}")
         row['EA_Comment']  = ea_preview
-        row['Report Name'] = ea_preview.replace(' ', '_') + '.htm'
+        row['Report Name'] = safe_report_name(ea_preview) + '.htm'
 
     # ── Editable preview table ─────────────────────────────────────────────────
     st.divider()
