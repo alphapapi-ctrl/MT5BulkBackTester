@@ -20,6 +20,7 @@ import queue
 import traceback
 from pathlib import Path
 from batch_diagnostics import SessionLog, JournalWatch, failure_summaries
+from terminal_control import close_selected_terminal
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -426,6 +427,7 @@ def _run_batch(set_files, set_folder, cfg, report_folder, lot_mode, lot_values,
             if not os.path.isdir(tester_folder):
                 raise FileNotFoundError(f'Tester folder missing: {tester_folder}')
             log.write('INFO', 'Terminal executable and Tester folder found.')
+            close_selected_terminal(terminal_path, log.write)
             # Copy and modify set file
             rel_path   = os.path.relpath(set_path, set_folder)
             rel_subdir = os.path.dirname(rel_path)
@@ -934,6 +936,7 @@ def render():
         disabled=st.session_state['bb_running'],
         help='Every run records milestones and errors. Verbose mode also records new terminal and tester journal lines. Logs are available below the results and saved under batch_runs.')
     col_run, col_stop = st.columns([2, 1])
+    st.caption('Starting a batch closes any open instance of the selected MT5 executable before testing. Other terminal installations are left open.')
 
     with col_run:
         run_disabled = st.session_state['bb_running'] or not set_files

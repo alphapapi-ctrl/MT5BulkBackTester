@@ -13,6 +13,7 @@ import time
 import uuid
 import traceback
 from batch_diagnostics import SessionLog, JournalWatch
+from terminal_control import close_selected_terminal
 import xml.etree.ElementTree as ET
 
 from mt5_batch_backtest import MODEL_MIGRATE, TF_ENUM_TO_PERIOD, PERIOD_MAP
@@ -156,12 +157,13 @@ class BatchRun:
     def start(self, jobs, cfg, skip_existing=False, timeout_hours=24, verbose_logging=False):
         self.thread = threading.Thread(target=run_batch,
             args=(jobs, dict(cfg), self.events, self.stop, skip_existing, timeout_hours),
-            kwargs={'session_logging': True, 'verbose_logging': verbose_logging}, daemon=True)
+            kwargs={'session_logging': True, 'verbose_logging': verbose_logging,
+                    'close_existing': True}, daemon=True)
         self.thread.start()
 
 
 def run_batch(jobs, cfg, events, stop, skip_existing=False, timeout_hours=24, mode='optimize',
-              session_logging=False, verbose_logging=False):
+              session_logging=False, verbose_logging=False, close_existing=False):
     log = None
     def record(level, message):
         if log is not None:
@@ -199,6 +201,8 @@ def run_batch(jobs, cfg, events, stop, skip_existing=False, timeout_hours=24, mo
                     continue
                 if not terminal.is_file() or not (data / 'MQL5').is_dir():
                     raise ValueError('Check the terminal executable and Tester folder in Active Config.')
+                if close_existing:
+                    close_selected_terminal(str(terminal), record)
                 if terminal_running(str(terminal)):
                     raise RuntimeError('The selected MT5 terminal is already open. Close it before starting a batch.')
                 record('INFO', 'Terminal executable and data folder found; selected terminal is not already running.')

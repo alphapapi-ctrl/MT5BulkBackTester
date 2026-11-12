@@ -120,7 +120,15 @@ class OptimizerTests(unittest.TestCase):
         with patch.object(opt.threading, 'Thread') as thread:
             opt.BatchRun().start([self.job], self.cfg, verbose_logging=True)
         self.assertEqual(thread.call_args.kwargs['kwargs'],
-                         {'session_logging': True, 'verbose_logging': True})
+                         {'session_logging': True, 'verbose_logging': True, 'close_existing': True})
+
+    def test_close_failure_prevents_launch(self):
+        events = queue.Queue()
+        with patch.object(opt, 'close_selected_terminal', side_effect=RuntimeError('Could not close selected terminal')), patch.object(opt.subprocess, 'Popen') as launch:
+            opt.run_batch([self.job], self.cfg, events, threading.Event(), close_existing=True)
+        launch.assert_not_called()
+        self.assertEqual(events.get_nowait()['status'], 'failed')
+        self.assertEqual(events.get_nowait()['status'], 'complete')
 
     def test_runner_collects_xml_and_cleans_staged_files(self):
         events, calls = self.run_fake()

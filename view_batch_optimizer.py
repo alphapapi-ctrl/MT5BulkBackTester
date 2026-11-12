@@ -145,7 +145,7 @@ def render():
                                'Symbol': st.column_config.TextColumn(required=True)})
             jobs = [{'path': path, 'symbol': str(row['Symbol'] or '').strip(), 'period': row['Period']}
                     for path, row in zip(paths, edited)]
-            st.caption('Close the selected MT5 terminal before starting. Each optimization opens it '
+            st.caption('Starting a batch closes any open instance of the selected MT5 executable. Each optimization opens it '
                        'and closes it when finished, as in Batch Backtest.')
             if st.button('Start batch optimization', type='primary', key='bo_start',
                          disabled=bool(st.session_state.get('bb_running'))):

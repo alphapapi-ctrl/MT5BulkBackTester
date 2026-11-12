@@ -7,6 +7,9 @@ import uuid
 
 # Match explicit errors, never missing confirmation or generic troubleshooting text.
 FAILURE_RULES = [
+    (r'could not close selected terminal',
+     'The existing terminal could not be closed safely, so the test did not start.',
+     'Close the selected MT5 terminal manually, resolve any open dialog, then retry the batch.'),
     (r'authorization failed|authentication failed|invalid (?:account|password)|not authorized',
      'MT5 reported a login problem.',
      'Check the account number, password and broker server in the selected terminal.'),

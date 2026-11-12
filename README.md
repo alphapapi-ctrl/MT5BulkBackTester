@@ -72,3 +72,5 @@ Enable **Verbose session logging** before starting for newly appended MT5 journa
 Common credential values and long numeric identifiers are masked, but paths and EA-generated messages can still contain private information: review downloads before sharing. Session folders stay excluded from Git. CLI runs retain their existing `events.jsonl` logging; the session log viewer is shared by both dashboard batch pages. Optimizer logs also record method/criterion, timeouts, matching-report skips and stop-after-current status.
 
 The log viewer includes a plain-English summary for each failed test, with suggested checks and supporting entries. Summaries use explicit error evidence from that test; missing confirmation is not treated as a failure cause. Unexplained failures are labelled as such. Older saved session logs are supported.
+
+Dashboard batches normally close any existing process for the exact selected terminal executable by PID, waiting up to 15 seconds per process. Other terminal installations are not closed. If the selected terminal refuses a normal close, the test fails with guidance instead of forcibly killing it. CLI busy-terminal checks remain unchanged.
