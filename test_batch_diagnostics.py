@@ -5,10 +5,45 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from batch_diagnostics import SessionLog, JournalWatch
+from batch_diagnostics import SessionLog, JournalWatch, failure_summaries
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_failure_summary_separates_tests_and_ignores_recovered_errors(self):
+        def line(level, message):
+            return f'2026-11-12T00:00:00+00:00 [{level}] {message}'
+        lines = [
+            line('INFO', 'Preparing C:\\sets\\first.set: symbol=BAD; timeframe=H1'),
+            line('ERROR', 'MT5: unknown symbol BAD'),
+            line('ERROR', 'failed: first.set No report found'),
+            line('INFO', 'Preparing second.set: symbol=EURUSD; timeframe=H1'),
+            line('WARNING', 'Account login not confirmed'),
+            line('ERROR', 'No report produced. Review journal errors above for authorization, symbol/history, EA loading or terminal/data-folder issues.'),
+            line('ERROR', 'failed: second.set No report found'),
+            line('INFO', 'Preparing recovered.set: symbol=EURUSD; timeframe=H1'),
+            line('ERROR', 'MT5: no connection'),
+            line('INFO', 'done: recovered.set Report saved'),
+        ]
+        summaries = failure_summaries(lines)
+        self.assertEqual(len(summaries), 2)
+        self.assertIn('requested instrument', summaries[0]['findings'][0][0])
+        self.assertIn('does not establish', summaries[1]['findings'][0][0])
+        self.assertNotIn('login problem', str(summaries))
+
+    def test_failure_summary_timeout_and_setup(self):
+        summaries = failure_summaries([
+            'now [ERROR] error: Batch could not start: PermissionError: access denied',
+        ])
+        self.assertEqual(summaries[0]['file'], 'Batch setup')
+        self.assertIn('denied', summaries[0]['findings'][0][0])
+        summaries = failure_summaries([
+            'now [INFO] Preparing one.set: symbol=EURUSD; timeframe=H1',
+            'now [ERROR] Time limit reached; terminating the owned terminal.',
+            'now [ERROR] failed: one.set Optimization exceeded the configured time limit.',
+        ])
+        self.assertEqual(len(summaries[0]['findings']), 1)
+        self.assertIn('time limit', summaries[0]['findings'][0][0])
+
     def test_default_errors_and_masking(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = SessionLog(root=tmp)

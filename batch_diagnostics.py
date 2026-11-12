@@ -5,6 +5,90 @@ import re
 import uuid
 
 
+# Match explicit errors, never missing confirmation or generic troubleshooting text.
+FAILURE_RULES = [
+    (r'authorization failed|authentication failed|invalid (?:account|password)|not authorized',
+     'MT5 reported a login problem.',
+     'Check the account number, password and broker server in the selected terminal.'),
+    (r'unknown symbol|invalid symbol|symbol.*not found|symbol.*not available',
+     'MT5 could not use the requested instrument.',
+     'Check the exact broker symbol, including its suffix, and whether this account offers it.'),
+    (r'no history|not enough history|history.*(?:failed|unavailable)|no (?:price|tick) data',
+     'MT5 reported missing or unavailable price history.',
+     'Check the requested dates and test model, and download history for that symbol in MT5.'),
+    (r'(?:cannot|failed to) load.*(?:expert|\.ex5)|expert.*(?:not found|loading failed)|initialization failed|oninit.*failed',
+     'The EA could not load or initialise.',
+     'Check the selected EA, its inputs, required files and any licence restrictions in the tester journal.'),
+    (r'terminal executable missing|tester folder missing|check the terminal executable',
+     'The configured terminal or data folder could not be found.',
+     'Check the terminal executable and its matching Tester folder in Active Config.'),
+    (r'terminal is already open',
+     'The selected terminal was already open, so this test did not start.',
+     'Close that terminal before retrying the batch.'),
+    (r'time limit reached|exceeded the configured time limit',
+     'The test exceeded its configured time limit.',
+     'Increase the per-set time limit or reduce the optimisation range after checking that MT5 is making progress.'),
+    (r'permissionerror|permission denied|access is denied|access denied',
+     'Access to a required file or process was denied.',
+     'Check folder permissions and whether another program has locked the file.'),
+    (r'no enabled optimization inputs',
+     'The set has no parameters enabled for optimisation.',
+     'Enable the intended optimisation inputs and ranges in MT5, then save the set again.'),
+    (r'no connection|connection failed|connection.*lost',
+     'MT5 reported a connection problem.',
+     'Check internet connectivity and the broker server connection in the selected terminal.'),
+    (r'mt5 exited with code|terminal exited: code=(?!0\b)-?\d+',
+     'The terminal exited with an error code.',
+     'Review the nearby tester journal entries for the underlying error before retrying.'),
+]
+
+
+def failure_summaries(lines):
+    """Read an entire session incrementally; keep each test's evidence separate."""
+    summaries = []
+    current = None
+
+    def finish():
+        if current is not None and current['failed']:
+            if not current['findings']:
+                current['findings'].append((
+                    'This test failed, but the captured log does not establish the cause.',
+                    'Check the error details below, the terminal/data-folder pairing, EA settings and report location. Enable verbose logging for a retry if more detail is needed.'))
+            summaries.append(current)
+
+    for raw in lines:
+        match = re.match(r'^\S+ \[(\w+)\] (.*)$', raw.rstrip())
+        if not match:
+            continue
+        level, message = match.groups()
+        if message.startswith('Preparing '):
+            finish()
+            name = message[len('Preparing '):].split(': symbol=', 1)[0]
+            current = {'file': name, 'failed': False, 'findings': [], 'evidence': []}
+        if level != 'ERROR':
+            continue
+        # Queue outcome is the authority: journal errors can be recovered from.
+        outcome = re.match(r'^(failed|error): ', message)
+        if current is None and outcome:
+            current = {'file': 'Batch setup', 'failed': False, 'findings': [], 'evidence': []}
+        if current is None:
+            continue
+        if outcome:
+            current['failed'] = True
+        if message.startswith('No report produced. Review journal errors above'):
+            continue  # This is our generic checklist, not evidence of a cause.
+        for pattern, explanation, checks in FAILURE_RULES:
+            if re.search(pattern, message, re.I):
+                finding = (explanation, checks)
+                if finding not in current['findings']:
+                    current['findings'].append(finding)
+                    current['evidence'].append(message[:600])
+        if outcome and not current['evidence']:
+            current['evidence'].append(message[:600])
+    finish()
+    return summaries
+
+
 def redact(value):
     text = str(value)
     text = re.sub(r"(?i)((?:password|passwd|token|secret)\s*[=:]\s*)\S+", r"\1[redacted]", text)

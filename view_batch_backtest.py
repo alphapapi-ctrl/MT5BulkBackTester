@@ -19,7 +19,7 @@ import threading
 import queue
 import traceback
 from pathlib import Path
-from batch_diagnostics import SessionLog, JournalWatch
+from batch_diagnostics import SessionLog, JournalWatch, failure_summaries
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -310,6 +310,19 @@ def render_session_logs(key_prefix='bb'):
                                 key=key_prefix + '_log_selection')
         st.caption(str(selected))
         try:
+            with selected.open(encoding='utf-8', errors='replace') as source:
+                failures = failure_summaries(source)
+            st.markdown('**Failure summary — what happened and what to check**')
+            if not failures:
+                st.caption('No failed tests recorded in this session yet.')
+            for failure in failures:
+                st.text(failure['file'])
+                for explanation, checks in failure['findings']:
+                    st.warning(explanation)
+                    st.write('What to check: ' + checks)
+                with st.expander('Supporting log entries'):
+                    st.code('\n'.join(failure['evidence']), language='text')
+            st.markdown('**Full session log**')
             # Keep live rendering bounded. The download contains the full file.
             with selected.open('rb') as source:
                 source.seek(0, 2)
